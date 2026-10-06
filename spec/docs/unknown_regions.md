@@ -148,9 +148,9 @@ regions have known purpose but unknown exact semantics:
 - **Status**: Not decoded
 
 ### [32:36] `u32_32` (uint32)
-- **Observed**: Always 410
-- **Hypothesis**: GPS message rate or protocol version
-- **Status**: Constant across all test files; unexpected values trigger a warning
+- **Observed**: 410 in most files. A Rush SR session logged 2025-09-27 carries 688144 (0x0A8010) and 688391 (0x0A8107) instead, alongside the same GPS channels and sample rate as files that carry 410.
+- **Hypothesis**: Not a constant. The values may be packed fields or a logger firmware or configuration variant.
+- **Status**: Not decoded. No parser reads it, so any value is accepted without a warning
 
 ## idn (Logger Identity, 56 bytes)
 
