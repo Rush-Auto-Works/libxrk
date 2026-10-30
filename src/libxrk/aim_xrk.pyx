@@ -30,6 +30,21 @@ from . import base
 # units
 # dec ptr
 
+# Bytes between two progress callbacks. The previous value, 8_000_000, meant no
+# callback fired at all for any file under 8 MB — which is most single-session
+# logs. 256 KB gives ~20 callbacks on a 5 MB file and ~160 on a 42 MB one, for
+# no measurable cost. Keep in step with DEFAULT_PROGRESS_INTERVAL in
+# crates/libxrk/src/parser.rs so both backends call back at the same positions.
+_PROGRESS_INTERVAL = 262_144
+
+# The parallel path below is only attempted where the platform can start
+# threads. Pyodide/WebAssembly cannot: there, passing a progress callback made
+# the decode fail with "RuntimeError: can't start new thread" — the same file
+# decoded fine without a callback and failed with one. The sequential path
+# invokes the callback the same way, so nothing is lost but the parallelism,
+# which does not exist on that platform anyway.
+_THREADS_AVAILABLE = sys.platform not in ('emscripten', 'wasi')
+
 dc_slots = {'slots': True} if sys.version_info.minor >= 10 else {}
 
 @dataclass(**dc_slots)
@@ -329,7 +344,7 @@ def _decode_sequence(s, progress=None):
     tok_GPS: cython.uint = _tokdec('GPS')
     tok_GPS1: cython.uint = _tokdec('GPS1')
     tok_GNFI: cython.uint = _tokdec('GNFI')
-    progress_interval: cython.Py_ssize_t = 8_000_000
+    progress_interval: cython.Py_ssize_t = _PROGRESS_INTERVAL
     next_progress: cython.Py_ssize_t = progress_interval
     pos: cython.Py_ssize_t = 0
     oldpos: cython.Py_ssize_t = pos
@@ -1014,7 +1029,7 @@ def _decode_sequence(s, progress=None):
     if not channels:
         t4 = time.perf_counter()
         pass # nothing to do
-    elif progress:
+    elif progress and _THREADS_AVAILABLE:
         with concurrent.futures.ThreadPoolExecutor(max_workers=min(2, os.cpu_count())) as worker:
             bg_work = worker.submit(_bg_gps_laps, <cython.uchar[:gpsmsg.size()]> &gpsmsg[0],
                                     <cython.uchar[:gnfimsg.size()]> &gnfimsg[0] if gnfimsg.size() else None,
@@ -1227,9 +1242,9 @@ def _decode_gps(gpsmsg, time_offset):
         deltas = (((np.diff(timecodes.astype(np.int64)) & 0xFFFF) ^ 0x8000) - 0x8000)
         timecodes = (timecodes[0] + np.concatenate(([0], deltas.cumsum()))).astype(timecodes.dtype)
     # NAV-SOL fields (known, used for position/velocity)
-    #itow_ms = alldata[4:].cast('I')[::56//4]       # iTOW - GPS time of week
+    itow_ms = np.asarray(alldata[4:].cast('I')[::56//4])      # iTOW - GPS time of week [ms]
     #fTOW_ns = alldata[8:].cast('i')[::56//4]       # fTOW - fractional TOW [ns]
-    #weekN = alldata[12:].cast('H')[::56//2]         # GPS week number
+    weekN = np.asarray(alldata[12:].cast('H')[::56//2])       # GPS week number
     ecefX_cm = alldata[16:].cast('i')[::56//4]       # ecefX [cm]
     ecefY_cm = alldata[20:].cast('i')[::56//4]       # ecefY [cm]
     ecefZ_cm = alldata[24:].cast('i')[::56//4]       # ecefZ [cm]
@@ -1313,7 +1328,12 @@ def _decode_gps(gpsmsg, time_offset):
             Channel(long_name='GPS_LateralAcc', units='g', dec_pts=2, interpolate=True,
                     timecodes=timecodes, sampledata=memoryview(lateral_acc.astype(np.float32))),
             Channel(long_name='GPS_Yaw_Rate', units='deg/s', dec_pts=1, interpolate=True,
-                    timecodes=timecodes, sampledata=memoryview(yaw_rate.astype(np.float32)))]
+                    timecodes=timecodes, sampledata=memoryview(yaw_rate.astype(np.float32))),
+            # Raw GPS clock (NAV-SOL iTOW / week). iTOW wraps every 604800000 ms.
+            Channel(long_name='GPS_ITOW', units='ms', dec_pts=0, interpolate=False,
+                    timecodes=timecodes, sampledata=memoryview(itow_ms.astype(np.float64))),
+            Channel(long_name='GPS_Week', units='', dec_pts=0, interpolate=False,
+                    timecodes=timecodes, sampledata=memoryview(weekN.astype(np.float32)))]
 
 def _decode_gnfi(gnfimsg, time_offset):
     """Parse GNFI messages and return timecodes array.
